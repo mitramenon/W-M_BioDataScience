@@ -1,0 +1,366 @@
+---
+title: "Spatial data analyses and genetic association"
+author: "Mitra Menon"
+date: '`r Sys.Date()`'
+output: 
+  html_notebook:
+    number_sections: yes
+    theme: paper
+    toc: yes
+    toc_float: yes
+editor_options: 
+  chunk_output_type: console
+---
+
+
+```{css, echo=FALSE}
+pre, code {white-space:pre !important; overflow-x:auto}
+```
+
+# Load R libraries
+```{r}
+LIBS<-c("data.table","RCurl","raster","remotes","sp","rgdal","rgeos","prevR","amap","geosphere","poppr","PopGenReport","ggplot2")
+
+# Install packages not yet installed
+installed_packages <- LIBS %in% rownames(installed.packages())
+if (any(installed_packages == FALSE)) {
+  install.packages(LIBS[!installed_packages])
+}
+
+
+# Packages loading
+invisible(lapply(LIBS, library, character.only = TRUE))
+
+#packages from github
+if (!requireNamespace("WorldClimTiles", quietly = TRUE))
+   remotes::install_github("kapitzas/WorldClimTiles")
+library(WorldClimTiles)
+
+```
+
+
+# Load in your dataset containing lat-long information 
+*We will load it directly from github*
+
+```{r}
+
+Landrace<-fread("https://raw.githubusercontent.com/mitramenon/Lang-Assoc/main/Landraces_MXonly_1611.txt",sep="\t",
+                header=T,data.table=F)
+head(Landrace)
+dim(Landrace)
+
+
+```
+
+#  Getting worldClim bioclim data 
+
+## Get rasters 
+
+### First determine the and download only the desired region
+
+*See [here](https://worldclim.org/data/bioclim.html) for what the variables mean*
+
+Data needs to be downloaded for 30 arc sec (i.e 1km2). This is the finest resolution available and will take some time to download for the whole world and may take up great deal of space on your personal laptop.\
+<br/>
+Since we only need a small area we can use the `tile_get` function from `WorldClimTiles` to determine what regions we need and then download the raster files only for those regions. 
+
+
+```{r}
+boundary <- getData("GADM", country = "MX", level = 0)
+tilenames <- tile_name(boundary, name = 'worldclim')
+tilenames
+
+```
+
+Now download the rasters for the desiered tiles. Make sure you specify the desired working directory below with `setwd` as a folder named wc0.5 will be downloaded to this location.
+```{r}
+#setwd("~/Google Drive/My Drive/Language_assoc/")
+#wctiles <- tile_get(tiles = tilenames, name = 'worldclim', var = "bio")
+```
+
+### Merge rasters from different tiles
+
+Now combine the tiles for each bioclim variable. 
+We have 19 bioclim rasters and we will save them all in a list format so they can be easily accessed later and can use the wonderful lapply function which makes life easier. 
+```{r}
+
+AllTiles<-vector("list",19) #make empty list
+bioclims<-paste0(rep("bio",19),seq(1,19),"_")
+
+for (f in 1:length(AllTiles)){
+  
+  cat("working on bioClim", bioclims[f],"\n")
+  
+  bio<-list.files("~/Google Drive/My Drive/Language_assoc/wc0.5/",bioclims[f],full.names = T) #list all tiles for a bioclim
+  bio<-bio[grepl(".bil",bio)] 
+  bio<-lapply(bio,function(X) raster(X))
+  AllTiles[[f]]<-do.call(merge,bio) #combine all tiles for each bioclim
+}
+
+names(AllTiles)<-bioclims
+
+```
+
+###  Checks
+Check if stuff looks as expected (i.e our desired geographic area is convered by the raster)
+```{r}
+plot(AllTiles[[1]])
+
+```
+
+##  Extract values from raster
+
+Create a raster stack and extract values for all locations from the rasters at once. 
+*This is why we extracted our rasters into a list.*
+```{r}
+S<-stack(AllTiles)
+pts<-SpatialPoints(Landrace[ ,c("longitude","latitude")]) #longitude always comes before latitude
+clim<-extract(S,pts)
+
+
+clim<-cbind(Landrace,clim)
+clim<-clim[complete.cases(clim$bio1_), ] #just double checking that there are no NAs in the raster for our points
+```
+
+
+# Getting language data
+
+Please download the language data [here](https://github.com/mitramenon/W-M_BioDataScience). 
+I have also provided a link to the website there for you to explore more about native languages across the world. 
+
+Here the data is of the from SpatialPolygons, so we use a different set of commands to read in the dataset. The directory indigenousLanguages has a set of files. They all hold important information about the polygons and hence we use `readOGR` to read the directory itself. 
+```{r}
+#make sure to direct R to the folder name. Not the individual files
+lang<-readOGR(dsn=path.expand("~/Google Drive/My Drive/Language_assoc/indigenousLanguages")) 
+```
+
+SpatialPolygons holds a bunch of information in the tab called attributes (`attr`) and be accessed using @. For now we are only interested in the polygons (areas deliniated by each language)
+```{r}
+polys = attr(lang,'polygons')
+names(polys)<-lang$Name
+```
+
+## Pulling out languages for each point
+
+###  Determine if point is within a polygon using the function `point.in.polygon`
+
+We need to cook up some code to do this. 
+
+Here we use a for loop to move through each polygon and determine if our point falls within it. Again the output is stored in a list that we intialised before the for loop.
+```{r}
+npolys = length(polys)
+polyID<-vector("list",npolys)
+
+for (i in 1:npolys){
+  
+  #evaluate one polygon at a time
+  
+  poly = polys[[i]]
+  polys2 = attr(poly,'Polygons')[[1]] # we don't have any further layers in our polygon so [[1]] works
+  coords = coordinates(polys2)
+  out<-point.in.polygon(Landrace$longitude,Landrace$latitude,coords[ ,1],coords[ ,2])
+  
+  polyID[[i]]<-out
+     
+  }
+ 
+```
+
+### Refine the language dataset
+
+We will use `do.call` to bind the list into a matrix.
+For our analysis we are only interested in languages that are present in atleast one of the locations. 
+
+Also check if there are any samples that don't fall in any of the polygons. 
+*Use the `?` function in R to determine why I am using colSums & rowSums != 0 below. Hint: What does a value =!0 mean for a point in a polygon?*
+```{r}
+names(polyID)<-lang$Name
+polyID<-do.call(cbind,polyID)
+
+polyID_pr<-polyID[ ,colSums(polyID)!=0]
+rownames(polyID_pr)<-Landrace$TaxonID
+
+polyID_pr<-polyID_pr[rowSums(polyID_pr)!=0, ]
+head(polyID_pr)
+
+```
+
+# Check that the dimensions of the two datasets are equal. If not adjust it as needed
+```{r}
+nrow(polyID_pr)==nrow(clim)
+```
+
+
+# Genomic dataset
+
+## Background and some key information
+This data was generated as a part of the SeeDs project(add link).
+Genomic datasets are usually provided in [vcfformat](https://www.ebi.ac.uk/training/online/courses/human-genetic-variation-introduction/variant-identification-and-analysis/understanding-vcf-format/) and can be manipulated using [vcftools](http://vcftools.sourceforge.net/man_latest.html). 
+
+For ease of examining the data I have converted the file from vcf to a 012 file. Each column represent a location in the genome and each row represents the individual that was sequenced. Since we are dealing with diploid individuals, at each position in the genome 0 means a sample has two reference allele (let's say AA), 1 means the sample has one reference alle (i.e AT) and 2 means the sample has two non-reference allele (i.e TT). Regions where we don't have enough information to make this call are declared missing and coded as -1. 
+So we can essentially treat these as count data now. 
+*.012.gz stores all the genomic data, *.pos stores the chromosome ID and the specific position on each chromosome (it has two columns), *.indv stores IDs of the individuals that we sequenced. 
+
+*Note: Genomic datasets are typically huge and the current set only represents 5% of the total genomic regions sampled. Thus most poplation genomic analyses require high performance computer clusters that allow for fast, parallel processing of many samples at once. These clusters are available at research institutions and via amazon and google too. They provide access to many computing nodes and lots of CPU and memory.*
+
+##  Read in the genomic dataset
+We will use fread to do this since it is faster than read.table or read.csv and can read in compressed files
+```{r}
+df012<-fread("https://raw.githubusercontent.com/mitramenon/Lang-Assoc/main/Genotypes/LandraceAllchr_noDupsMX_posFilter.012.gz",sep="\t",data.table=F)
+
+pos<-fread("https://raw.githubusercontent.com/mitramenon/Lang-Assoc/main/Genotypes/LandraceAllchr_noDupsMX_posFilter.012.pos",sep="\t",data.table=F)
+
+ID<-fread("https://raw.githubusercontent.com/mitramenon/Lang-Assoc/main/Genotypes/LandraceAllchr_noDupsMX_posFilter.012.indv",data.table=F,header=F)
+
+```
+
+## Examine the dataset and add genomic location ID and sample ID to the 012 file
+
+```{r}
+dim(df012) 
+df012[1:4,1:5]
+df012<-df012[ ,-1]
+```
+
+
+```{r}
+pos$location<-paste(pos$V1,pos$V2,sep=":")
+colnames(df012)<-pos$location
+rownames(df012)<-ID$V1
+df012[1:4,1:5]
+          
+```
+
+## Simple data manipulation.
+Convert all -1 to NA & remove any genomic regions (columns here) with any missing data.
+```{r}
+df012<-as.matrix(df012)
+df012[df012==-1]<-NA
+
+df012<-apply(df012,2,function(X) as.numeric(X))
+df012[1:4,1:5]
+is.numeric(df012[ ,1])
+df012_noMiss<-df012[ , colSums(is.na(df012)) == 0] #remove all missing data
+
+dim(df012_noMiss)
+```
+
+# Caluclate distance measures for all our predcitors & our response variable
+Remember our goal is to evaluate what variables best explain the genetic diversity in Maize/Corn that is grown by farmers in Mexico.
+
+##  Climate data
+This is numeric continuous. We only need the 19 bioclims. 
+```{r}
+
+climOnly<-clim[ ,-c(1:12)]
+climOnly_sc<-scale(climOnly,scale = T,center = T) #essential due to the different units of measurment for climate data
+head(climOnly)
+clim.dist<-dist(climOnly,method = "euclidean")
+
+#convert to square matrix
+clim.dist<-as.matrix(clim.dist)
+```
+
+## Altitude (as this has been shown to be important for Maize)
+```{r}
+alt<-clim$elevation
+alt<-scale(alt,center = T,scale = T)
+alt.dist<-dist(alt,method="euclidean")
+alt.dist<-as.matrix(alt.dist)
+```
+
+## Language data
+
+Distance metric to use for ordinal data such as the 0,1,2,3 from language. 
+Several approaches :
+-Recode 0 as 4 and use kendall distance.
+-Recode all values other than 1 to 0 and use euclidean
+-Recode 2 & 3 as 0.5 and then use euclidean, 0 is 0 and 1 is 1.
+
+*Let's go with the 3rd approach for now*
+```{r}
+polyID_pr[polyID_pr==2]<-0.5
+polyID_pr[polyID_pr==3]<-0.5
+
+lang.dist<-dist(polyID_pr,method="euclidean")
+lang.dist<-as.matrix(lang.dist)
+```
+
+## Geography
+
+Geodesic Distance metric for lat-long on WGS84
+```{r}
+df = clim[ ,c("longitude","latitude")] # the order should be longitude, latitude
+GeoDist<-distm(df, df, distGeo)
+dim(GeoDist)
+```
+
+## Genetic distance (*This will take a while to run*)
+The data should be in the folder you downloaded from Github
+I am providing the example here, but don't run it. Ideally this would be run on a computing cluster where you can hit go and let it run for a few days until the output is generated. 
+So you are "working" without necessarily working! :) 
+
+We will use the Roger's matrix which simply estimates euclidean genetic distances for individual samples. A better one to use if you are working with populations is Fst (Fstastics)
+
+```{r}
+#st<-Sys.time()
+#Gen.dist <- rogers.dist(df012_noMiss) #takes about half hr
+#Sys.time()-st
+#fwrite(as.matrix(Gen.dist),file="~/Google Drive/My Drive/Language_assoc/Gen.Dist_roger.txt",sep="\t",compress="gzip",quote=F,row.names = F,col.names = F)
+
+```
+
+As I mentioned earlier, to save time we will simply load the distance dataset provided again in the folder you downloaded from github.
+```{r}
+Gen.dist<-fread("https://raw.githubusercontent.com/mitramenon/W-M_BioDataScience/main/Gen.dist_roger.gz",sep="\t",data.table=F)
+Gen.dist[1:4,1:5]
+```
+
+# Genetic association
+
+Now finally we are ready to conduct the genetic association and determine the contribution of language, geography, elevation and climate towards the noted genetic diversity.
+We will perform matrix regression using the function `lgrMMRR`. 
+
+## Data prep & running the analysis
+```{r}
+GLC<-vector("list",3)
+names(GLC)<-c("genD","euc","cost")
+GLC[[1]]<-as.matrix(Gen.dist) #genetic distance matrix
+GLC[[2]]<-GeoDist #geography dist matrix
+GLC[[3]]<-vector("list",3) #list of cost dist matrices
+GLC$cost[[1]]<-clim.dist
+GLC$cost[[2]]<-lang.dist
+GLC$cost[[3]]<-alt.dist
+names(GLC$cost)<-c("climate","language","elevation")
+  
+
+Mregress_total<-lgrMMRR(GLC$genD,  cost.mats= GLC$cost,eucl.mat=GLC$euc, nperm=9)
+
+```
+
+## Pull out effect sizes and p-values for each predictor 
+
+*p-value and effect sizes are stored in the mmrr.tab (p-vale for each predictor here is represented as tpvalue)
+```{r}
+rownames(Mregress_total$mmrr.tab)<-as.character(Mregress_total$mmrr.tab$layer)
+
+climOut<-Mregress_total$mmrr.tab["climate", c(2,4)]
+GeoOut<-Mregress_total$mmrr.tab["Euclidean" ,c(2,4) ]
+ElvOut<-Mregress_total$mmrr.tab["elevation" ,c(2,4) ]
+LangOut<-Mregress_total$mmrr.tab["language" ,c(2,4) ]
+MMRout<-unlist(c(unlist(Mregress_total$mmrr.tab$r2[1]),climOut,GeoOut,ElvOut,LangOut))
+  
+MMRout
+```
+
+## Make pie chart using ggplot
+```{r}
+
+output<- data.frame(predictor=c("Geo","climate","Language","elevation"),
+                    value=c(GeoOut$coefficient,climOut$coefficient,LangOut$coefficient,ElvOut$coefficient))
+output$value<-output$value*100
+
+ggplot(output, aes(x="", y=value, fill=predictor)) +
+  geom_bar(stat="identity", width=1, color="white") +
+  coord_polar("y", start=0) +theme_void()
+```
