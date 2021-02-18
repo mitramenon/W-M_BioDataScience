@@ -74,8 +74,8 @@ tilenames
 
 Now download the rasters for the desiered tiles. Make sure you specify the desired working directory below with `setwd` as a folder named wc0.5 will be downloaded to this location.
 ```{r}
-#setwd("~/Google Drive/My Drive/Language_assoc/")
-#wctiles <- tile_get(tiles = tilenames, name = 'worldclim', var = "bio")
+setwd("~/Google Drive/My Drive/Language_assoc/")
+wctiles <- tile_get(tiles = tilenames, name = 'worldclim', var = "bio")
 ```
 
 ### Merge rasters from different tiles
@@ -303,9 +303,8 @@ So you are "working" without necessarily working! :)
 We will use the Roger's matrix which simply estimates euclidean genetic distances for individual samples. A better one to use if you are working with populations is Fst (Fstastics)
 
 ```{r}
-#st<-Sys.time()
+
 #Gen.dist <- rogers.dist(df012_noMiss) #takes about half hr
-#Sys.time()-st
 #fwrite(as.matrix(Gen.dist),file="~/Google Drive/My Drive/Language_assoc/Gen.Dist_roger.txt",sep="\t",compress="gzip",quote=F,row.names = F,col.names = F)
 
 ```
